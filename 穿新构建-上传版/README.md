@@ -40,6 +40,10 @@
 
 ## 快速开始
 
+### 克隆库
+```bash
+git clone https://github.com/spicytougan/file-reasoning.git
+```
 ### 安装依赖
 ```bash
 pip install requests chardet
