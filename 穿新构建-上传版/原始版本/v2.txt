@@ -1,0 +1,238 @@
+import tkinter as tk
+from tkinter import filedialog
+import requests
+import json
+import chardet
+
+# 读取配置文件
+with open('config.json', 'r', encoding='utf-8') as f:
+    config = json.load(f)
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from time import sleep
+import random
+
+def create_gui():
+    root = tk.Tk()
+    root.title("文件推理工具")
+    
+    # 提示词输入框
+    prompt_frame = tk.Frame(root)
+    prompt_frame.pack(pady=10)
+    
+    tk.Label(prompt_frame, text="系统提示词:").pack(side=tk.LEFT)
+    prompt_entry = tk.Entry(prompt_frame, width=50)
+    prompt_entry.insert(0, "你是学习专家，帮忙研究提到的问题，用中文来研究俄语问题。如果遇到计算题，请用纯文本格式回答计算题，不要使用LaTeX公式。")  # 默认提示词
+    prompt_entry.pack(side=tk.LEFT, padx=5)
+    
+    # 文件选择按钮
+    button = tk.Button(root, text="选择文件并开始推理", command=select_files)
+    button.pack(pady=10)
+    
+    # 将提示词输入框作为全局变量
+    global system_prompt_entry
+    system_prompt_entry = prompt_entry
+    
+    root.mainloop()
+
+def select_files():
+    # 获取用户输入的系统提示词
+    system_prompt = system_prompt_entry.get()
+    
+    file_paths = filedialog.askopenfilenames(title="选择文件", filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")])
+    if not file_paths:
+        print("未选择文件。")
+        return
+
+    print(f"已选择 {len(file_paths)} 个文件。")
+    total_files = len(file_paths)
+    for i, file_path in enumerate(file_paths, start=1):
+        print(f"正在处理文件 {i}/{total_files}: {file_path}")
+        try:
+            with open(file_path, 'rb') as f:
+                rawdata = f.read()
+                result = chardet.detect(rawdata)
+                encoding = result['encoding']
+                confidence = result['confidence']
+                print(f"检测到编码: {encoding}, 置信度: {confidence}")
+
+            if encoding is None:
+                encodings_to_try = ['utf-8', 'gbk', 'Windows-1252']
+                for enc in encodings_to_try:
+                    try:
+                        with open(file_path, 'r', encoding=enc) as file:
+                            text = file.read()
+                            break
+                    except UnicodeDecodeError:
+                        continue
+                    except Exception as e:
+                        print(f"读取文件时出错: {e}")
+                        return
+                else:
+                    print("无法使用任何尝试的编码解码文件。")
+                    return
+            else:
+                try:
+                    with open(file_path, 'r', encoding=encoding) as file:
+                        text = file.read()
+                except Exception as e:
+                    print(f"读取文件时出错: {e}")
+                    return
+
+            # Split text into chunks of max context size
+            chunk_size = config["model_config"]["max_context"]
+            chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+            
+            print(f"文件内容被分割为 {len(chunks)} 个块进行推理")
+            
+            # 根据API URL设置并发数
+            if "deepseek.com" in config["api_url"]:
+                max_workers = 10  # Deepseek API不限制并发
+            else:
+                max_workers = 2  # 其他API保持低并发
+            retry_attempts = 3  # Number of retry attempts per chunk
+            retry_delay = 5  # Delay between retries in seconds
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(infer_with_retry, chunk_text, file_path, chunk_num, retry_attempts, retry_delay, system_prompt): chunk_num
+                    for chunk_num, chunk_text in enumerate(chunks, start=1)
+                }
+                    
+                # Add delay between starting each request
+                sleep_interval = 2  # seconds between starting requests
+                sleep_count = 0
+                for future in futures:
+                    if sleep_count > 0:
+                        sleep(sleep_interval)
+                    sleep_count += 1
+                    
+                for future in as_completed(futures):
+                    chunk_num = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"处理第 {chunk_num} 个块时出错: {e}")
+        except Exception as e:
+            print(f"处理文件 {file_path} 时出错: {e}")
+            continue
+
+def infer(text, file_path, chunk_num=1, delay=None, system_prompt="你是优化专家"):
+    """
+    Perform inference on a chunk of text.
+    Optionally add a delay before the request.
+    """
+    if delay:
+        sleep(delay)
+
+    url = config["api_url"]
+    payload = {
+        "model": config["model_name"],
+        "stream": True,
+        "max_tokens": config["model_config"]["max_tokens"],
+        "temperature": config["model_config"]["temperature"],
+        "top_p": config["model_config"]["top_p"],
+        "top_k": config["model_config"]["top_k"],
+        "frequency_penalty": config["model_config"]["frequency_penalty"],
+        "n": 1,
+        "messages": [
+            {
+                "content": system_prompt,
+                "role": "system"
+            },
+            {
+                "content": text,
+                "role": "user"
+            }
+        ],
+        "response_format": {"type": config["model_config"]["response_format"]}
+    }
+    headers = {
+        "Authorization": f"Bearer {config['api_key']}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        print(f"正在发送API请求...")
+        response = requests.request("POST", url, json=payload, headers=headers, stream=True, timeout=30)
+        print(f"API响应状态码: {response.status_code}")
+        buffer = ""
+        first_chunk = True
+        output_file = f"{file_path}.output.txt"
+        mode = 'a' if chunk_num > 1 else 'w'  # Append if not first chunk
+        with open(output_file, mode, encoding='utf-8') as f:
+            if chunk_num > 1:
+                f.write("\n\n")  # Add separator between chunks
+            for chunk in response.iter_content(chunk_size=None):
+                decoded_chunk = chunk.decode('utf-8')
+                buffer += decoded_chunk
+                for line in buffer.splitlines():
+                    if line.startswith("data: "):
+                        line = line[6:]
+                    try:
+                        data = json.loads(line)
+                        if 'choices' not in data or len(data['choices']) == 0:
+                            print(f"API返回的响应缺少 'choices' 字段: {data}")
+                            return
+                        delta = data['choices'][0]['delta']
+
+                        if first_chunk:
+                            if 'role' in delta and delta['role'] == 'assistant':
+                                f.write("<assistant>")
+                                print("<assistant>", end="", flush=True)
+                            first_chunk = False
+
+                        # 根据响应判断是否为推理模型
+                        is_reasoner = 'reasoning_content' in delta
+                        
+                        # 处理推理模型的响应
+                        if is_reasoner:
+                            # 同时处理reasoning_content和content
+                            reasoning_content = delta.get('reasoning_content', '')
+                            content = delta.get('content', '')
+                            if reasoning_content:
+                                f.write(str(reasoning_content))
+                                print(str(reasoning_content), end="", flush=True)
+                            if content:
+                                f.write(str(content))
+                                print(str(content), end="", flush=True)
+                        else:
+                            # 处理普通模型的响应
+                            content = delta.get('content', '')
+                            if content:
+                                f.write(str(content))
+                                print(str(content), end="", flush=True)
+
+                        buffer = ""
+                    except json.JSONDecodeError:
+                        continue
+                    except Exception as e:
+                        print(f"处理过程中发生错误: {e}")
+                        print(f"API返回的原始数据: {line}")
+                        return
+            f.write("</assistant>")
+            print("</assistant>")
+        print(f"推理结果已保存到: {output_file}")
+
+    except requests.exceptions.ConnectionError as e:
+        raise Exception(f"网络连接错误: {e}")
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"API请求失败: {e}")
+
+def infer_with_retry(text, file_path, chunk_num, retry_attempts=3, retry_delay=5, system_prompt="你是优化专家"):
+    """
+    Perform inference with retry logic.
+    """
+    for attempt in range(retry_attempts):
+        try:
+            # Add random jitter to delay to avoid synchronized retries
+            delay = retry_delay * (1 + random.random()) if attempt > 0 else None
+            return infer(text, file_path, chunk_num, delay, system_prompt)
+        except Exception as e:
+            if attempt == retry_attempts - 1:
+                raise e
+            print(f"第 {chunk_num} 个块第 {attempt + 1} 次尝试失败: {e}")
+            print(f"等待 {retry_delay} 秒后重试...")
+            sleep(retry_delay)
+
+# 启动GUI
+create_gui()

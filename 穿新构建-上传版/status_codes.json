@@ -1,0 +1,12 @@
+{
+  "200": "OK - 请求成功",
+  "201": "Created - 资源创建成功", 
+  "204": "No Content - 请求成功，但无返回内容",
+  "400": "Bad Request - 请求参数错误",
+  "401": "Unauthorized - 未授权访问",
+  "403": "Forbidden - 禁止访问",
+  "404": "Not Found - 资源未找到",
+  "429": "Too Many Requests - 请求过于频繁",
+  "500": "Internal Server Error - 服务器内部错误",
+  "503": "Service Unavailable - 服务不可用"
+}
